@@ -45,6 +45,16 @@ class Conv(nn.Module):
 
     def forward(self, x):
         return self.act(self.bn(self.conv(x)))
+        #print("000000000000")
+        #if (x.type() == 'torch.musa.FloatTensor'):
+            #import ipdb; ipdb.set_trace()
+        #out = self.conv(x)
+        #print("1111111111111")
+        #out = self.bn(out)
+        #print("222222222222222")
+        #out = self.act(out)
+        #print("3333333o333333")
+        #return out
 
     def forward_fuse(self, x):
         return self.act(self.conv(x))

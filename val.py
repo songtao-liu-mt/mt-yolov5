@@ -23,6 +23,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from copy import deepcopy
 
 import numpy as np
 import torch
@@ -114,7 +115,7 @@ def run(
         project=ROOT / 'runs/val',  # save to project/name
         name='exp',  # save to project/name
         exist_ok=False,  # existing project/name ok, do not increment
-        half=True,  # use FP16 half-precision inference
+        half=False,  # use FP16 half-precision inference
         dnn=False,  # use OpenCV DNN for ONNX inference
         model=None,
         dataloader=None,
@@ -157,7 +158,7 @@ def run(
     cuda = device.type != 'cpu'
     is_coco = isinstance(data.get('val'), str) and data['val'].endswith(f'coco{os.sep}val2017.txt')  # COCO dataset
     nc = 1 if single_cls else int(data['nc'])  # number of classes
-    iouv = torch.linspace(0.5, 0.95, 10, device=device)  # iou vector for mAP@0.5:0.95
+    iouv = torch.linspace(0.5, 0.95, 10)  # iou vector for mAP@0.5:0.95
     niou = iouv.numel()
 
     # Dataloader
@@ -190,20 +191,23 @@ def run(
     jdict, stats, ap, ap_class = [], [], [], []
     callbacks.run('on_val_start')
     pbar = tqdm(dataloader, desc=s, bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}')  # progress bar
+    odevice = device
     for batch_i, (im, targets, paths, shapes) in enumerate(pbar):
+        device = odevice
         callbacks.run('on_val_batch_start')
         t1 = time_sync()
-        if cuda:
-            im = im.to(device, non_blocking=True)
-            targets = targets.to(device)
         im = im.half() if half else im.float()  # uint8 to fp16/32
         im /= 255  # 0 - 255 to 0.0 - 1.0
         nb, _, height, width = im.shape  # batch size, channels, height, width
+        if cuda:
+            im = im.to(device, non_blocking=True)
+            #targets = targets.to(device)
         t2 = time_sync()
         dt[0] += t2 - t1
 
         # Inference
         out, train_out = model(im) if training else model(im, augment=augment, val=True)  # inference, loss outputs
+
         dt[1] += time_sync() - t2
 
         # Loss
@@ -211,13 +215,16 @@ def run(
             loss += compute_loss([x.float() for x in train_out], targets)[1]  # box, obj, cls
 
         # NMS
-        targets[:, 2:] *= torch.tensor((width, height, width, height), device=device)  # to pixels
+        targets[:, 2:] *= torch.tensor((width, height, width, height), device='cpu')  # to pixels
         lb = [targets[targets[:, 0] == i, 1:] for i in range(nb)] if save_hybrid else []  # for autolabelling
         t3 = time_sync()
+        out = out.cpu()
         out = non_max_suppression(out, conf_thres, iou_thres, labels=lb, multi_label=True, agnostic=single_cls)
         dt[2] += time_sync() - t3
 
         # Metrics
+        targets = targets.cpu()
+        device = 'cpu'
         for si, pred in enumerate(out):
             labels = targets[targets[:, 0] == si, 1:]
             nl, npr = labels.shape[0], pred.shape[0]  # number of labels, predictions

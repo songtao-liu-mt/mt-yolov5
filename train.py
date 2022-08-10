@@ -118,7 +118,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         with torch_distributed_zero_first(LOCAL_RANK):
             weights = attempt_download(weights)  # download if not found locally
         ckpt = torch.load(weights, map_location='cpu')  # load checkpoint to CPU to avoid CUDA memory leak
-        model = Model(cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+        model = Model(cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors'))  # create
+        #model = Model(cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
         exclude = ['anchor'] if (cfg or hyp.get('anchors')) and not resume else []  # exclude keys
         csd = ckpt['model'].float().state_dict()  # checkpoint state_dict as FP32
         csd = intersect_dicts(csd, model.state_dict(), exclude=exclude)  # intersect
@@ -127,7 +128,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     else:
         #model = Model(cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
         model = Model(cfg, ch=3, nc=nc, anchors=hyp.get('anchors'))  # create
-        model = model.to("mtgpu")
+        #model = model.to(device)
     #amp = check_amp(model)  # check AMP
     amp = False
 
@@ -149,66 +150,41 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         loggers.on_params_update({"batch_size": batch_size})
 
     # Optimizer
-    nbs = 64  # nominal batch size
-    accumulate = max(round(nbs / batch_size), 1)  # accumulate loss before optimizing
-    hyp['weight_decay'] *= batch_size * accumulate / nbs  # scale weight_decay
-    LOGGER.info(f"Scaled weight_decay = {hyp['weight_decay']}")
+    #nbs = 64  # nominal batch size
+    #accumulate = max(round(nbs / batch_size), 1)  # accumulate loss before optimizing
+    #hyp['weight_decay'] *= batch_size * accumulate / nbs  # scale weight_decay
+    #LOGGER.info(f"Scaled weight_decay = {hyp['weight_decay']}")
 
-    g = [], [], []  # optimizer parameter groups
-    bn = tuple(v for k, v in nn.__dict__.items() if 'Norm' in k)  # normalization layers, i.e. BatchNorm2d()
-    for v in model.modules():
-        if hasattr(v, 'bias') and isinstance(v.bias, nn.Parameter):  # bias
-            g[2].append(v.bias)
-        if isinstance(v, bn):  # weight (no decay)
-            g[1].append(v.weight)
-        elif hasattr(v, 'weight') and isinstance(v.weight, nn.Parameter):  # weight (with decay)
-            g[0].append(v.weight)
+    #g = [], [], []  # optimizer parameter groups
+    #bn = tuple(v for k, v in nn.__dict__.items() if 'Norm' in k)  # normalization layers, i.e. BatchNorm2d()
+    #for v in model.modules():
+        #if hasattr(v, 'bias') and isinstance(v.bias, nn.Parameter):  # bias
+            #g[2].append(v.bias)
+        #if isinstance(v, bn):  # weight (no decay)
+            #g[1].append(v.weight)
+        #elif hasattr(v, 'weight') and isinstance(v.weight, nn.Parameter):  # weight (with decay)
+            #g[0].append(v.weight)
 
-    if opt.optimizer == 'Adam':
-        optimizer = Adam(g[2], lr=hyp['lr0'], betas=(hyp['momentum'], 0.999))  # adjust beta1 to momentum
-    elif opt.optimizer == 'AdamW':
-        optimizer = AdamW(g[2], lr=hyp['lr0'], betas=(hyp['momentum'], 0.999))  # adjust beta1 to momentum
-    else:
-        optimizer = SGD(g[2], lr=hyp['lr0'], momentum=hyp['momentum'], nesterov=True)
+    #if opt.optimizer == 'Adam':
+        #optimizer = Adam(g[2], lr=hyp['lr0'], betas=(hyp['momentum'], 0.999))  # adjust beta1 to momentum
+    #elif opt.optimizer == 'AdamW':
+        #optimizer = AdamW(g[2], lr=hyp['lr0'], betas=(hyp['momentum'], 0.999))  # adjust beta1 to momentum
+    #else:
+        #optimizer = SGD(g[2], lr=hyp['lr0'], momentum=hyp['momentum'], nesterov=True)
 
-    optimizer.add_param_group({'params': g[0], 'weight_decay': hyp['weight_decay']})  # add g0 with weight_decay
-    optimizer.add_param_group({'params': g[1]})  # add g1 (BatchNorm2d weights)
-    LOGGER.info(f"{colorstr('optimizer:')} {type(optimizer).__name__} with parameter groups "
-                f"{len(g[1])} weight (no decay), {len(g[0])} weight, {len(g[2])} bias")
-    del g
+    #optimizer.add_param_group({'params': g[0], 'weight_decay': hyp['weight_decay']})  # add g0 with weight_decay
+    #optimizer.add_param_group({'params': g[1]})  # add g1 (BatchNorm2d weights)
+    #LOGGER.info(f"{colorstr('optimizer:')} {type(optimizer).__name__} with parameter groups "
+                #f"{len(g[1])} weight (no decay), {len(g[0])} weight, {len(g[2])} bias")
+    #del g
 
     # Scheduler
-    if opt.cos_lr:
-        lf = one_cycle(1, hyp['lrf'], epochs)  # cosine 1->hyp['lrf']
-    else:
-        lf = lambda x: (1 - x / epochs) * (1.0 - hyp['lrf']) + hyp['lrf']  # linear
-    scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)  # plot_lr_scheduler(optimizer, scheduler, epochs)
+    #if opt.cos_lr:
+        #lf = one_cycle(1, hyp['lrf'], epochs)  # cosine 1->hyp['lrf']
+    #else:
+        #lf = lambda x: (1 - x / epochs) * (1.0 - hyp['lrf']) + hyp['lrf']  # linear
+    #scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)  # plot_lr_scheduler(optimizer, scheduler, epochs)
 
-    # EMA
-    ema = ModelEMA(model) if RANK in {-1, 0} else None
-
-    # Resume
-    start_epoch, best_fitness = 0, 0.0
-    if pretrained:
-        # Optimizer
-        if ckpt['optimizer'] is not None:
-            optimizer.load_state_dict(ckpt['optimizer'])
-            best_fitness = ckpt['best_fitness']
-
-        # EMA
-        if ema and ckpt.get('ema'):
-            ema.ema.load_state_dict(ckpt['ema'].float().state_dict())
-            ema.updates = ckpt['updates']
-
-        # Epochs
-        start_epoch = ckpt['epoch'] + 1
-        if resume:
-            assert start_epoch > 0, f'{weights} training to {epochs} epochs is finished, nothing to resume.'
-        if epochs < start_epoch:
-            LOGGER.info(f"{weights} has been trained for {ckpt['epoch']} epochs. Fine-tuning for {epochs} more epochs.")
-            epochs += ckpt['epoch']  # finetune additional epochs
-
-        del ckpt, csd
 
     # DP mode
     '''
@@ -292,7 +268,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     hyp['label_smoothing'] = opt.label_smoothing
     model.nc = nc  # attach number of classes to model
     model.hyp = hyp  # attach hyperparameters to model
-    model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc  # attach class weights
+    model.class_weights = labels_to_class_weights(dataset.labels, nc) * nc  # attach class weights
     model.names = names
 
     # Start training
@@ -302,14 +278,81 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     last_opt_step = -1
     maps = np.zeros(nc)  # mAP per class
     results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
-    scheduler.last_epoch = start_epoch - 1  # do not move
     stopper, stop = EarlyStopping(patience=opt.patience), False
-    compute_loss = ComputeLoss(model)  # init loss class
+
+    model = model.to(device)
+    model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc  # attach class weights
+    compute_loss = ComputeLoss(model)  
+
+    # EMA
+    ema = ModelEMA(model, device) if RANK in {-1, 0} else None
+
+    # Resume
+    start_epoch, best_fitness = 0, 0.0
+    if pretrained:
+        # Optimizer
+        if ckpt['optimizer'] is not None:
+            optimizer.load_state_dict(ckpt['optimizer'])
+            best_fitness = ckpt['best_fitness']
+
+        # EMA
+        if ema and ckpt.get('ema'):
+            ema.ema.load_state_dict(ckpt['ema'].float().state_dict())
+            ema.updates = ckpt['updates']
+
+        # Epochs
+        start_epoch = ckpt['epoch'] + 1
+        if resume:
+            assert start_epoch > 0, f'{weights} training to {epochs} epochs is finished, nothing to resume.'
+        if epochs < start_epoch:
+            LOGGER.info(f"{weights} has been trained for {ckpt['epoch']} epochs. Fine-tuning for {epochs} more epochs.")
+            epochs += ckpt['epoch']  # finetune additional epochs
+
+        del ckpt, csd
+
+    nbs = 64  # nominal batch size
+    #nbs = 8  # nominal batch size
+    accumulate = max(round(nbs / batch_size), 1)  # accumulate loss before optimizing
+    hyp['weight_decay'] *= batch_size * accumulate / nbs  # scale weight_decay
+    LOGGER.info(f"Scaled weight_decay = {hyp['weight_decay']}")
+
+    g = [], [], []  # optimizer parameter groups
+    bn = tuple(v for k, v in nn.__dict__.items() if 'Norm' in k)  # normalization layers, i.e. BatchNorm2d()
+    for v in model.modules():
+        if hasattr(v, 'bias') and isinstance(v.bias, nn.Parameter):  # bias
+            g[2].append(v.bias)
+        if isinstance(v, bn):  # weight (no decay)
+            g[1].append(v.weight)
+        elif hasattr(v, 'weight') and isinstance(v.weight, nn.Parameter):  # weight (with decay)
+            g[0].append(v.weight)
+
+    if opt.optimizer == 'Adam':
+        optimizer = Adam(g[2], lr=hyp['lr0'], betas=(hyp['momentum'], 0.999))  # adjust beta1 to momentum
+    elif opt.optimizer == 'AdamW':
+        optimizer = AdamW(g[2], lr=hyp['lr0'], betas=(hyp['momentum'], 0.999))  # adjust beta1 to momentum
+    else:
+        optimizer = SGD(g[2], lr=hyp['lr0'], momentum=hyp['momentum'], nesterov=True)
+
+    optimizer.add_param_group({'params': g[0], 'weight_decay': hyp['weight_decay']})  # add g0 with weight_decay
+    optimizer.add_param_group({'params': g[1]})  # add g1 (BatchNorm2d weights)
+    LOGGER.info(f"{colorstr('optimizer:')} {type(optimizer).__name__} with parameter groups "
+                f"{len(g[1])} weight (no decay), {len(g[0])} weight, {len(g[2])} bias")
+    del g
+
+    if opt.cos_lr:
+        lf = one_cycle(1, hyp['lrf'], epochs)  # cosine 1->hyp['lrf']
+    else:
+        lf = lambda x: (1 - x / epochs) * (1.0 - hyp['lrf']) + hyp['lrf']  # linear
+    scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)  # plot_lr_scheduler(optimizer, scheduler, epochs)
+    scheduler.last_epoch = start_epoch - 1  # do not move
+
+
     callbacks.run('on_train_start')
     LOGGER.info(f'Image sizes {imgsz} train, {imgsz} val\n'
                 f'Using {train_loader.num_workers * WORLD_SIZE} dataloader workers\n'
                 f"Logging results to {colorstr('bold', save_dir)}\n"
                 f'Starting training for {epochs} epochs...')
+
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         callbacks.run('on_train_epoch_start')
         model.train()
@@ -335,7 +378,6 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
             callbacks.run('on_train_batch_start')
             ni = i + nb * epoch  # number integrated batches (since train start)
-            #imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
             imgs = imgs.float().to(device, non_blocking=True) / 255  # uint8 to float32, 0-255 to 0.0-1.0
 
             # Warmup
@@ -369,6 +411,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             # Backward
             #scaler.scale(loss).backward()
             loss.backward()
+
 
             # Optimize
             if ni - last_opt_step >= accumulate:
@@ -410,7 +453,9 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                                            save_dir=save_dir,
                                            plots=False,
                                            callbacks=callbacks,
-                                           compute_loss=compute_loss)
+                                           compute_loss=None)
+                                           #compute_loss=compute_loss)
+
 
             # Update best mAP
             fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
@@ -425,10 +470,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 ckpt = {
                     'epoch': epoch,
                     'best_fitness': best_fitness,
-                    #'model': deepcopy(de_parallel(model)).half(),
-                    #'ema': deepcopy(ema.ema).half(),
-                    'model': deepcopy(de_parallel(model)).float(),
-                    'ema': deepcopy(ema.ema).float(),
+                    'model': deepcopy(de_parallel(model)),
+                    'ema': deepcopy(ema.ema),
                     'updates': ema.updates,
                     'optimizer': optimizer.state_dict(),
                     'wandb_id': loggers.wandb.wandb_run.id if loggers.wandb else None,
@@ -437,8 +480,10 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 # Save last, best and delete
                 torch.save(ckpt, last)
                 if best_fitness == fi:
-                    torch.save(ckpt, best)
+                    continue
+                    #torch.save(ckpt, best)
                 if opt.save_period > 0 and epoch % opt.save_period == 0:
+                    continue
                     torch.save(ckpt, w / f'epoch{epoch}.pt')
                 del ckpt
                 callbacks.run('on_model_save', last, epoch, final_epoch, best_fitness, fi)
@@ -465,7 +510,6 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                         data_dict,
                         batch_size=batch_size // WORLD_SIZE * 2,
                         imgsz=imgsz,
-                        #model=attempt_load(f, device).half(),
                         model=attempt_load(f, device).float(),
                         iou_thres=0.65 if is_coco else 0.60,  # best pycocotools results at 0.65
                         single_cls=single_cls,
@@ -474,8 +518,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                         save_json=is_coco,
                         verbose=True,
                         plots=plots,
-                        callbacks=callbacks,
-                        compute_loss=compute_loss)  # val best model with plots
+                        callbacks=callbacks, )
+                        #compute_loss=compute_loss)  # val best model with plots
                     if is_coco:
                         callbacks.run('on_fit_epoch_end', list(mloss) + list(results) + lr, epoch, best_fitness, fi)
 

@@ -1,1 +1,1 @@
-python train.py --img 640 --batch 2 --epochs 1 --data coco128.yaml --device mtgpu --weights "" --cfg models/yolov5s.yaml
+python train.py --img 320 --batch 2 --epochs 60 --data coco128.yaml --device mtgpu --weights "weights/yolov5s.pt" --cfg models/yolov5s.yaml
