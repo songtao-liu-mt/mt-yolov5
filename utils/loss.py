@@ -139,23 +139,24 @@ class ComputeLoss:
                 gi = gi.cpu()
                 pxy, pwh, _, pcls = pi[b, a, gj, gi].split((2, 2, 1, self.nc), 1)  # target-subset of predictions
 
-                #pxy = pxy.to("mtgpu")
-                #pwh = pwh.to("mtgpu")
+                pxy = pxy.to("mtgpu")
+                pwh = pwh.to("mtgpu")
                 pcls = pcls.to(self.device)
 
                 # Regression
                 pxy = pxy.sigmoid() * 2 - 0.5
-                #pwh = (pwh.sigmoid() * 2) ** 2 * anchors[i]
-                pwh = (pwh.sigmoid() * 2) ** 2 * (anchors[i].cpu())
+                pwh = (pwh.sigmoid() * 2) ** 2 * anchors[i]
+                #pwh = (pwh.sigmoid() * 2) ** 2 * (anchors[i].cpu())
                 pbox = torch.cat((pxy, pwh), 1)  # predicted box
 
-                tbox = [bb.cpu() for bb in tbox]
+                #tbox = [bb.cpu() for bb in tbox]
                 iou = bbox_iou(pbox, tbox[i], CIoU=True).squeeze()  # iou(prediction, target)
                 lbox += (1.0 - iou).mean()  # iou loss
 
                 # Objectness
                 tobj = tobj.cpu()
 
+                iou = iou.cpu()
                 iou = iou.detach().clamp(0).type(tobj.dtype)
                 if self.sort_obj_iou:
                     j = iou.argsort()
@@ -229,17 +230,18 @@ class ComputeLoss:
                 t = t.cpu()
                 j = j.cpu()
 
+                #import ipdb; ipdb.set_trace()
                 t = t[j]  # filter
 
-                # t = t.to("mtgpu")
+                t = t.to("mtgpu")
 
                 # Offsets
                 gxy = t[:, 2:4]  # grid xy
-                #gxi = gain[[2, 3]] - gxy  # inverse
+                gxi = gain[[2, 3]] - gxy  # inverse
 
-                gxi = gain[[2, 3]].cpu() - gxy  # inverse
-                gxy = gxy.cpu()
-                gxi = gxi.cpu()
+                #gxi = gain[[2, 3]].cpu() - gxy  # inverse
+                #gxy = gxy.cpu()
+                #gxi = gxi.cpu()
 
                 #import ipdb; ipdb.set_trace()
                 j, k = ((gxy % 1 < g) & (gxy > 1)).T
@@ -249,11 +251,17 @@ class ComputeLoss:
                 # l = l.to("mtgpu")
                 # m = m.to("mtgpu")
                 j = torch.stack((torch.ones_like(j), j, k, l, m))
+
+                t = t.cpu()
+                j = j.cpu()
                 t = t.repeat((5, 1, 1))[j]
 
-                off = off.cpu()
+                t = t.to("mtgpu")
 
-                offsets = (torch.zeros_like(gxy)[None] + off[:, None])[j]
+                # off = off.cpu()
+
+                offsets = (torch.zeros_like(gxy.cpu())[None] + off.cpu()[:, None])[j]
+                offsets = offsets.to("mtgpu")
             else:
                 t = targets[0]
                 offsets = 0
@@ -261,22 +269,27 @@ class ComputeLoss:
 
             # Define
             bc, gxy, gwh, a = t.chunk(4, 1)  # (image, class), grid xy, grid wh, anchors
+            bc = bc.contiguous()
+            a = a.contiguous()
             a, (b, c) = a.long().view(-1), bc.long().T  # anchors, image, class
             gij = (gxy - offsets).long()
             gi, gj = gij.T  # grid indices
 
+            gi = gi.contiguous()
+            gj = gj.contiguous()
+
             # Append
-            indice = (b.to(self.device), a.to(self.device),gj.clamp_(0, shape[2] - 1).to(self.device), gi.clamp_(0, shape[3] - 1).to(self.device)) 
-            #indice = (b, a, gj.clamp_(0, shape[2] - 1), gi.clamp_(0, shape[3] - 1)) 
+            #indice = (b.to(self.device), a.to(self.device),gj.clamp_(0, shape[2] - 1).to(self.device), gi.clamp_(0, shape[3] - 1).to(self.device)) 
+            indice = (b, a, gj.clamp_(0, shape[2] - 1), gi.clamp_(0, shape[3] - 1)) 
             indices.append(indice)  # image, anchor, grid
-            box = torch.cat((gxy - gij, gwh), 1).to(self.device)
-            #box = torch.cat((gxy - gij, gwh), 1)
+            #box = torch.cat((gxy - gij, gwh), 1).to(self.device)
+            box = torch.cat((gxy - gij, gwh), 1)
             tbox.append(box)  # box
-            aanchors = anchors.cpu()
-            an = aanchors[a].to(self.device)
-            #an = aanchors[a]
+            #aanchors = anchors.cpu()
+            #an = aanchors[a].to(self.device)
+            an = anchors[a]
             anch.append(an)  # anchors
-            tcls.append(c.to(self.device))  # class
-            #tcls.append(c)  # class
+            #tcls.append(c.to(self.device))  # class
+            tcls.append(c)  # class
 
         return tcls, tbox, indices, anch
