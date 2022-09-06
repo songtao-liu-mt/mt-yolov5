@@ -132,16 +132,20 @@ class ComputeLoss:
             n = b.shape[0]  # number of targets
             if n:
                 # pxy, pwh, _, pcls = pi[b, a, gj, gi].tensor_split((2, 4, 5), dim=1)  # faster, requires torch 1.8.0
-                pi = pi.cpu()
-                b = b.cpu()
-                a = a.cpu()
-                gj = gj.cpu()
-                gi = gi.cpu()
+                #pi = pi.cpu()
+                #b = b.cpu()
+                #a = a.cpu()
+                #gj = gj.cpu()
+                #gi = gi.cpu()
+                b = b.contiguous()
+                a = a.contiguous()
+                gj = gj.contiguous()
+                gi = gi.contiguous()
                 pxy, pwh, _, pcls = pi[b, a, gj, gi].split((2, 2, 1, self.nc), 1)  # target-subset of predictions
 
-                pxy = pxy.to("mtgpu")
-                pwh = pwh.to("mtgpu")
-                pcls = pcls.to(self.device)
+                #pxy = pxy.to("mtgpu")
+                #pwh = pwh.to("mtgpu")
+                #pcls = pcls.to(self.device)
 
                 # Regression
                 pxy = pxy.sigmoid() * 2 - 0.5
@@ -154,9 +158,9 @@ class ComputeLoss:
                 lbox += (1.0 - iou).mean()  # iou loss
 
                 # Objectness
-                tobj = tobj.cpu()
+                #tobj = tobj.cpu()
+                #iou = iou.cpu()
 
-                iou = iou.cpu()
                 iou = iou.detach().clamp(0).type(tobj.dtype)
                 if self.sort_obj_iou:
                     j = iou.argsort()
@@ -165,22 +169,24 @@ class ComputeLoss:
                     iou = (1.0 - self.gr) + self.gr * iou
                 tobj[b, a, gj, gi] = iou  # iou ratio
 
-                tobj = tobj.to(self.device)
+                #tobj = tobj.to(self.device)
 
                 # Classification
                 if self.nc > 1:  # cls loss (only if multiple classes)
                     t = torch.full_like(pcls, self.cn, device=self.device)  # targets
-                    t = t.cpu()
-                    tcls = [cc.cpu() for cc in tcls]
+                    #t = t.cpu()
+                    #tcls = [cc.cpu() for cc in tcls]
+                    #tmp = tcls[i].contiguous()
+                    #t[range(n), tmp] = self.cp
                     t[range(n), tcls[i]] = self.cp
-                    t = t.to(self.device)
+                    #t = t.to(self.device)
                     lcls += self.BCEcls(pcls, t)  # BCE
 
                 # Append targets to text file
                 # with open('targets.txt', 'a') as file:
                 #     [file.write('%11.5g ' * 4 % tuple(x) + '\n') for x in torch.cat((txy[i], twh[i]), 1)]
 
-            pi = pi.to(self.device)
+            #pi = pi.to(self.device)
             obji = self.BCEobj(pi[..., 4], tobj)
             lobj += obji * self.balance[i]  # obj loss
             if self.autobalance:
@@ -227,13 +233,12 @@ class ComputeLoss:
                 j = torch.max(r, 1 / r).max(2)[0] < self.hyp['anchor_t']  # compare
                 # j = wh_iou(anchors, t[:, 4:6]) > model.hyp['iou_t']  # iou(3,n)=wh_iou(anchors(3,2), gwh(n,2))
 
-                t = t.cpu()
-                j = j.cpu()
+                #t = t.cpu()
+                #j = j.cpu()
 
-                #import ipdb; ipdb.set_trace()
                 t = t[j]  # filter
 
-                t = t.to("mtgpu")
+                #t = t.to("mtgpu")
 
                 # Offsets
                 gxy = t[:, 2:4]  # grid xy
@@ -252,16 +257,18 @@ class ComputeLoss:
                 # m = m.to("mtgpu")
                 j = torch.stack((torch.ones_like(j), j, k, l, m))
 
-                t = t.cpu()
-                j = j.cpu()
+                #t = t.cpu()
+                #j = j.cpu()
+                j = j.contiguous()
                 t = t.repeat((5, 1, 1))[j]
 
-                t = t.to("mtgpu")
+                #t = t.to("mtgpu")
 
-                # off = off.cpu()
+                #off = off.cpu()
 
-                offsets = (torch.zeros_like(gxy.cpu())[None] + off.cpu()[:, None])[j]
-                offsets = offsets.to("mtgpu")
+                offsets = (torch.zeros_like(gxy)[None] + off[:, None])[j]
+                #offsets = (torch.zeros_like(gxy.cpu())[None] + off.cpu()[:, None])[j]
+                #offsets = offsets.to("mtgpu")
             else:
                 t = targets[0]
                 offsets = 0
@@ -290,6 +297,7 @@ class ComputeLoss:
             an = anchors[a]
             anch.append(an)  # anchors
             #tcls.append(c.to(self.device))  # class
+            c = c.contiguous()
             tcls.append(c)  # class
 
         return tcls, tbox, indices, anch
