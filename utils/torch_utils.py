@@ -18,6 +18,8 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
+import horovod.torch as hvd
+
 from utils.general import LOGGER, file_date, git_describe
 
 try:
@@ -37,6 +39,15 @@ def torch_distributed_zero_first(local_rank: int):
     yield
     if local_rank == 0:
         dist.barrier(device_ids=[0])
+
+@contextmanager
+def hvd_distributed_zero_first(local_rank: int):
+    # Decorator to make all processes in distributed training wait for each local_master to do something
+    if local_rank not in [-1, 0]:
+        hvd.barrier(hvd.ProcessSet([local_rank]))
+    yield
+    if local_rank == 0:
+        hvd.barrier(hvd.ProcessSet([0]))
 
 
 def device_count():

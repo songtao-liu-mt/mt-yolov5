@@ -30,7 +30,8 @@ import yaml
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import SGD, Adam, AdamW, lr_scheduler
 from tqdm import tqdm
-import musa_torch_extension
+import horovod
+import horovod.torch as hvd
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
@@ -55,7 +56,7 @@ from utils.loggers.wandb.wandb_utils import check_wandb_resume
 from utils.loss import ComputeLoss
 from utils.metrics import fitness
 from utils.plots import plot_evolve, plot_labels
-from utils.torch_utils import EarlyStopping, ModelEMA, de_parallel, select_device, torch_distributed_zero_first
+from utils.torch_utils import EarlyStopping, ModelEMA, de_parallel, select_device, hvd_distributed_zero_first
 
 from torch.profiler import profile, record_function, ProfilerActivity
 
@@ -79,7 +80,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     if isinstance(hyp, str):
         with open(hyp, errors='ignore') as f:
             hyp = yaml.safe_load(f)  # load hyps dict
-    LOGGER.info(colorstr('hyperparameters: ') + ', '.join(f'{k}={v}' for k, v in hyp.items()))
+    if RANK in {-1, 0}:
+        LOGGER.info(colorstr('hyperparameters: ') + ', '.join(f'{k}={v}' for k, v in hyp.items()))
 
     # Save run settings
     if not evolve:
@@ -105,7 +107,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     plots = not evolve and not opt.noplots  # create plots
     cuda = device.type != 'cpu'
     init_seeds(opt.seed + 1 + RANK, deterministic=True)
-    with torch_distributed_zero_first(LOCAL_RANK):
+    with hvd_distributed_zero_first(LOCAL_RANK):
         data_dict = data_dict or check_dataset(data)  # check if None
     train_path, val_path = data_dict['train'], data_dict['val']
     nc = 1 if single_cls else int(data_dict['nc'])  # number of classes
@@ -117,7 +119,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     check_suffix(weights, '.pt')  # check weights
     pretrained = weights.endswith('.pt')
     if pretrained:
-        with torch_distributed_zero_first(LOCAL_RANK):
+        with hvd_distributed_zero_first(LOCAL_RANK):
             weights = attempt_download(weights)  # download if not found locally
         ckpt = torch.load(weights, map_location='cpu')  # load checkpoint to CPU to avoid CUDA memory leak
         model = Model(cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors'))  # create
@@ -150,58 +152,6 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     if RANK == -1 and batch_size == -1:  # single-GPU only, estimate best batch size
         batch_size = check_train_batch_size(model, imgsz, amp)
         loggers.on_params_update({"batch_size": batch_size})
-
-    # Optimizer
-    #nbs = 64  # nominal batch size
-    #accumulate = max(round(nbs / batch_size), 1)  # accumulate loss before optimizing
-    #hyp['weight_decay'] *= batch_size * accumulate / nbs  # scale weight_decay
-    #LOGGER.info(f"Scaled weight_decay = {hyp['weight_decay']}")
-
-    #g = [], [], []  # optimizer parameter groups
-    #bn = tuple(v for k, v in nn.__dict__.items() if 'Norm' in k)  # normalization layers, i.e. BatchNorm2d()
-    #for v in model.modules():
-        #if hasattr(v, 'bias') and isinstance(v.bias, nn.Parameter):  # bias
-            #g[2].append(v.bias)
-        #if isinstance(v, bn):  # weight (no decay)
-            #g[1].append(v.weight)
-        #elif hasattr(v, 'weight') and isinstance(v.weight, nn.Parameter):  # weight (with decay)
-            #g[0].append(v.weight)
-
-    #if opt.optimizer == 'Adam':
-        #optimizer = Adam(g[2], lr=hyp['lr0'], betas=(hyp['momentum'], 0.999))  # adjust beta1 to momentum
-    #elif opt.optimizer == 'AdamW':
-        #optimizer = AdamW(g[2], lr=hyp['lr0'], betas=(hyp['momentum'], 0.999))  # adjust beta1 to momentum
-    #else:
-        #optimizer = SGD(g[2], lr=hyp['lr0'], momentum=hyp['momentum'], nesterov=True)
-
-    #optimizer.add_param_group({'params': g[0], 'weight_decay': hyp['weight_decay']})  # add g0 with weight_decay
-    #optimizer.add_param_group({'params': g[1]})  # add g1 (BatchNorm2d weights)
-    #LOGGER.info(f"{colorstr('optimizer:')} {type(optimizer).__name__} with parameter groups "
-                #f"{len(g[1])} weight (no decay), {len(g[0])} weight, {len(g[2])} bias")
-    #del g
-
-    # Scheduler
-    #if opt.cos_lr:
-        #lf = one_cycle(1, hyp['lrf'], epochs)  # cosine 1->hyp['lrf']
-    #else:
-        #lf = lambda x: (1 - x / epochs) * (1.0 - hyp['lrf']) + hyp['lrf']  # linear
-    #scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)  # plot_lr_scheduler(optimizer, scheduler, epochs)
-
-
-    # DP mode
-    '''
-    if cuda and RANK == -1 and torch.cuda.device_count() > 1:
-        LOGGER.warning('WARNING: DP not recommended, use torch.distributed.run for best DDP Multi-GPU results.\n'
-                       'See Multi-GPU Tutorial at https://github.com/ultralytics/yolov5/issues/475 to get started.')
-        model = torch.nn.DataParallel(model)
-    '''
-
-    # SyncBatchNorm
-    '''
-    if opt.sync_bn and cuda and RANK != -1:
-        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
-        LOGGER.info('Using SyncBatchNorm()')
-    '''
 
     # Trainloader
     train_loader, dataset = create_dataloader(train_path,
@@ -308,7 +258,9 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
 
     optimizer.add_param_group({'params': g[0], 'weight_decay': hyp['weight_decay']})  # add g0 with weight_decay
     optimizer.add_param_group({'params': g[1]})  # add g1 (BatchNorm2d weights)
-    LOGGER.info(f"{colorstr('optimizer:')} {type(optimizer).__name__} with parameter groups "
+
+    if RANK in {-1, 0}:
+        LOGGER.info(f"{colorstr('optimizer:')} {type(optimizer).__name__} with parameter groups "
                 f"{len(g[1])} weight (no decay), {len(g[0])} weight, {len(g[2])} bias")
     del g
 
@@ -330,7 +282,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         if resume:
             assert start_epoch > 0, f'{weights} training to {epochs} epochs is finished, nothing to resume.'
         if epochs < start_epoch:
-            LOGGER.info(f"{weights} has been trained for {ckpt['epoch']} epochs. Fine-tuning for {epochs} more epochs.")
+            if RANK in {-1, 0}:
+                LOGGER.info(f"{weights} has been trained for {ckpt['epoch']} epochs. Fine-tuning for {epochs} more epochs.")
             epochs += ckpt['epoch']  # finetune additional epochs
 
         del ckpt, csd
@@ -338,7 +291,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     nbs = 64  # nominal batch size
     accumulate = max(round(nbs / batch_size), 1)  # accumulate loss before optimizing
     hyp['weight_decay'] *= batch_size * accumulate / nbs  # scale weight_decay
-    LOGGER.info(f"Scaled weight_decay = {hyp['weight_decay']}")
+    if RANK in {-1, 0}:
+        LOGGER.info(f"Scaled weight_decay = {hyp['weight_decay']}")
 
 
     if opt.cos_lr:
@@ -347,7 +301,17 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         lf = lambda x: (1 - x / epochs) * (1.0 - hyp['lrf']) + hyp['lrf']  # linear
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)  # plot_lr_scheduler(optimizer, scheduler, epochs)
     scheduler.last_epoch = start_epoch - 1  # do not move
-
+    
+    # Horovod: wrap optimizer with DistributedOptimizer.
+    optimizer = hvd.DistributedOptimizer(
+        optimizer, named_parameters=model.named_parameters(),
+        compression=hvd.Compression.none,
+        backward_passes_per_step=1,
+        op=hvd.Average)
+    
+    # Horovod: broadcast parameters & optimizer state.
+    hvd.broadcast_parameters(model.state_dict(), root_rank=0)
+    hvd.broadcast_optimizer_state(optimizer, root_rank=0)
 
     callbacks.run('on_train_start')
     LOGGER.info(f'Image sizes {imgsz} train, {imgsz} val\n'
@@ -373,8 +337,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         if RANK != -1:
             train_loader.sampler.set_epoch(epoch)
         pbar = enumerate(train_loader)
-        LOGGER.info(('\n' + '%10s' * 7) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'labels', 'img_size'))
         if RANK in {-1, 0}:
+            LOGGER.info(('\n' + '%10s' * 7) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'labels', 'img_size'))
             pbar = tqdm(pbar, total=nb, bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}')  # progress bar
         optimizer.zero_grad()
         # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], 
@@ -505,14 +469,14 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 del ckpt
                 callbacks.run('on_model_save', last, epoch, final_epoch, best_fitness, fi)
 
-        # EarlyStopping
-        if RANK != -1:  # if DDP training
-            broadcast_list = [stop if RANK == 0 else None]
-            dist.broadcast_object_list(broadcast_list, 0)  # broadcast 'stop' to all ranks
-            if RANK != 0:
-                stop = broadcast_list[0]
-        if stop:
-            break  # must break all DDP ranks
+        # # EarlyStopping
+        # if RANK != -1:  # if DDP training
+            # broadcast_list = [stop if RANK == 0 else None]
+            # dist.broadcast_object_list(broadcast_list, 0)  # broadcast 'stop' to all ranks
+            # if RANK != 0:
+                # stop = broadcast_list[0]
+        # if stop:
+            # break  # must break all DDP ranks
 
         # end epoch ----------------------------------------------------------------------------------------------------
     # end training -----------------------------------------------------------------------------------------------------
@@ -589,11 +553,20 @@ def parse_opt(known=False):
     parser.add_argument('--bbox_interval', type=int, default=-1, help='W&B: Set bounding-box image logging interval')
     parser.add_argument('--artifact_alias', type=str, default='latest', help='W&B: Version of dataset artifact to use')
 
+    # Horovd training
+    parser.add_argument('--num-proc', type=int)
+    parser.add_argument('--hosts', help='hosts to run on in notation: hostname:slots[,host2:slots[,...]]')
+    parser.add_argument('--communication', help='collaborative communication to use: gloo, mpi')
+
     opt = parser.parse_known_args()[0] if known else parser.parse_args()
     return opt
 
 
 def main(opt, callbacks=Callbacks()):
+    hvd.init()
+    WORLD_SIZE = hvd.size()
+    LOCAL_RANK = hvd.local_rank()  # https://pytorch.org/docs/stable/elastic/run.html
+    RANK = hvd.rank() if WORLD_SIZE > 1 else -1
     # Checks
     if RANK in {-1, 0}:
         print_args(vars(opt))
@@ -601,13 +574,14 @@ def main(opt, callbacks=Callbacks()):
         #check_requirements(exclude=['thop'])
 
     # Resume
-    if opt.resume and not check_wandb_resume(opt) and not opt.evolve:  # resume an interrupted run
+    if opt.resume and not opt.evolve:  # resume an interrupted run
         ckpt = opt.resume if isinstance(opt.resume, str) else get_latest_run()  # specified or most recent path
         assert os.path.isfile(ckpt), 'ERROR: --resume checkpoint does not exist'
         with open(Path(ckpt).parent.parent / 'opt.yaml', errors='ignore') as f:
             opt = argparse.Namespace(**yaml.safe_load(f))  # replace
         opt.cfg, opt.weights, opt.resume = '', ckpt, True  # reinstate
-        LOGGER.info(f'Resuming training from {ckpt}')
+        if RANK in {-1, 0}:
+            LOGGER.info(f'Resuming training from {ckpt}')
     else:
         opt.data, opt.cfg, opt.hyp, opt.weights, opt.project = \
             check_file(opt.data), check_yaml(opt.cfg), check_yaml(opt.hyp), str(opt.weights), str(opt.project)  # checks
@@ -621,17 +595,22 @@ def main(opt, callbacks=Callbacks()):
         opt.save_dir = str(increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok))
 
     # DDP mode
-    device = select_device(opt.device, batch_size=opt.batch_size)
     if LOCAL_RANK != -1:
         msg = 'is not compatible with YOLOv5 Multi-GPU DDP training'
         assert not opt.image_weights, f'--image-weights {msg}'
         assert not opt.evolve, f'--evolve {msg}'
         assert opt.batch_size != -1, f'AutoBatch with --batch-size -1 {msg}, please pass a valid --batch-size'
         assert opt.batch_size % WORLD_SIZE == 0, f'--batch-size {opt.batch_size} must be multiple of WORLD_SIZE'
-        assert torch.cuda.device_count() > LOCAL_RANK, 'insufficient CUDA devices for DDP command'
-        torch.cuda.set_device(LOCAL_RANK)
-        device = torch.device('cuda', LOCAL_RANK)
-        dist.init_process_group(backend="nccl" if dist.is_nccl_available() else "gloo")
+        os.environ["PVR_GPUIDX"] = str(hvd.local_rank())
+        os.environ["RANK"] = str(hvd.rank())
+
+    os.environ["MTGPU_MAX_MEM_USAGE_GB"] = "14"
+    import musa_torch_extension
+    device = select_device(opt.device, batch_size=opt.batch_size)
+        # assert torch.cuda.device_count() > LOCAL_RANK, 'insufficient CUDA devices for DDP command'
+        # torch.cuda.set_device(LOCAL_RANK)
+        # device = torch.device('cuda', LOCAL_RANK)
+        # dist.init_process_group(backend="nccl" if dist.is_nccl_available() else "gloo")
 
     # Train
     if not opt.evolve:
@@ -740,4 +719,14 @@ def run(**kwargs):
 
 if __name__ == "__main__":
     opt = parse_opt()
-    main(opt)
+    if opt.num_proc:
+    # run training through horovod.run
+        print('Running training through horovod.run')
+        horovod.run(main,
+                    args=(opt,),
+                    np=opt.num_proc,
+                    hosts=opt.hosts,
+                    use_gloo=opt.communication == 'gloo',
+                    use_mpi=opt.communication == 'mpi')
+    else:
+        main(opt)
