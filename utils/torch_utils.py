@@ -44,10 +44,12 @@ def torch_distributed_zero_first(local_rank: int):
 def hvd_distributed_zero_first(local_rank: int):
     # Decorator to make all processes in distributed training wait for each local_master to do something
     if local_rank not in [-1, 0]:
-        hvd.barrier(hvd.ProcessSet([local_rank]))
+        #hvd.barrier(hvd.ProcessSet([int(local_rank)]))
+        hvd.barrier()
     yield
     if local_rank == 0:
-        hvd.barrier(hvd.ProcessSet([0]))
+        #hvd.barrier(hvd.ProcessSet([0]))
+        hvd.barrier()
 
 
 def device_count():

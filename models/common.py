@@ -28,6 +28,7 @@ from utils.plots import Annotator, colors, save_one_box
 from utils.torch_utils import copy_attr, time_sync
 
 
+
 def autopad(k, p=None):  # kernel, padding
     # Pad to 'same'
     if p is None:

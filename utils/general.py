@@ -35,10 +35,11 @@ import yaml
 
 from utils.downloads import gsutil_getsize
 from utils.metrics import box_iou, fitness
+import horovod.torch as hvd
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[1]  # YOLOv5 root directory
-RANK = int(os.getenv('RANK', -1))
+#RANK = int(os.getenv('RANK', -1))
 
 # Settings
 DATASETS_DIR = ROOT.parent / 'datasets'  # YOLOv5 datasets directory
@@ -84,7 +85,9 @@ def set_logging(name=None, verbose=VERBOSE):
     if is_kaggle():
         for h in logging.root.handlers:
             logging.root.removeHandler(h)  # remove all handlers associated with the root logger object
-    rank = int(os.getenv('RANK', -1))  # rank in world for Multi-GPU trainings
+    #rank = int(os.getenv('RANK', -1))  # rank in world for Multi-GPU trainings
+    hvd.init()
+    rank = hvd.rank() if hvd.size() > 1 else -1
     level = logging.INFO if verbose and rank in {-1, 0} else logging.ERROR
     log = logging.getLogger(name)
     log.setLevel(level)
