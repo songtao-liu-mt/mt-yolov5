@@ -222,6 +222,7 @@ class ComputeLoss:
             device=self.device).float() * g  # offsets
 
         for i in range(self.nl):
+            no_obj = False
             anchors, shape = self.anchors[i], p[i].shape
             gain[2:6] = torch.tensor(shape)[[3, 2, 3, 2]]  # xyxy gain
 
@@ -237,45 +238,53 @@ class ComputeLoss:
                 #j = j.cpu()
 
                 t = t[j]  # filter
+                if t.shape[0] == 0:
+                    t = targets[0]
+                    offsets = 0
+                    no_obj = True
+                else:
+                    # Offsets
+                    gxy = t[:, 2:4]  # grid xy
+                    gxi = gain[[2, 3]] - gxy  # inverse
 
-                #t = t.to("mtgpu")
+                    #gxi = gain[[2, 3]].cpu() - gxy  # inverse
+                    #gxy = gxy.cpu()
+                    #gxi = gxi.cpu()
 
-                # Offsets
-                gxy = t[:, 2:4]  # grid xy
-                gxi = gain[[2, 3]] - gxy  # inverse
+                    #import ipdb; ipdb.set_trace()
+                    j, k = ((gxy % 1 < g) & (gxy > 1)).T
+                    l, m = ((gxi % 1 < g) & (gxi > 1)).T
+                    # j = j.to("mtgpu")
+                    # k = k.to("mtgpu")
+                    # l = l.to("mtgpu")
+                    # m = m.to("mtgpu")
+                    j = torch.stack((torch.ones_like(j), j, k, l, m))
 
-                #gxi = gain[[2, 3]].cpu() - gxy  # inverse
-                #gxy = gxy.cpu()
-                #gxi = gxi.cpu()
+                    #t = t.cpu()
+                    #j = j.cpu()
+                    j = j.contiguous()
+                    t = t.repeat((5, 1, 1))[j]
 
-                #import ipdb; ipdb.set_trace()
-                j, k = ((gxy % 1 < g) & (gxy > 1)).T
-                l, m = ((gxi % 1 < g) & (gxi > 1)).T
-                # j = j.to("mtgpu")
-                # k = k.to("mtgpu")
-                # l = l.to("mtgpu")
-                # m = m.to("mtgpu")
-                j = torch.stack((torch.ones_like(j), j, k, l, m))
+                    #t = t.to("mtgpu")
 
-                #t = t.cpu()
-                #j = j.cpu()
-                j = j.contiguous()
-                t = t.repeat((5, 1, 1))[j]
+                    #off = off.cpu()
 
-                #t = t.to("mtgpu")
-
-                #off = off.cpu()
-
-                offsets = (torch.zeros_like(gxy)[None] + off[:, None])[j]
-                #offsets = (torch.zeros_like(gxy.cpu())[None] + off.cpu()[:, None])[j]
-                #offsets = offsets.to("mtgpu")
+                    offsets = (torch.zeros_like(gxy)[None] + off[:, None])[j]
+                    #offsets = (torch.zeros_like(gxy.cpu())[None] + off.cpu()[:, None])[j]
+                    #offsets = offsets.to("mtgpu")
             else:
                 t = targets[0]
                 offsets = 0
+                no_obj = True
 
 
             # Define
             bc, gxy, gwh, a = t.chunk(4, 1)  # (image, class), grid xy, grid wh, anchors
+            if no_obj:
+                bc = bc.clone()
+                gxy = gxy.clone()
+                gwh = gwh.clone()
+                a = a.clone()
             bc = bc.contiguous()
             a = a.contiguous()
             a, (b, c) = a.long().view(-1), bc.long().T  # anchors, image, class
@@ -287,6 +296,11 @@ class ComputeLoss:
 
             # Append
             #indice = (b.to(self.device), a.to(self.device),gj.clamp_(0, shape[2] - 1).to(self.device), gi.clamp_(0, shape[3] - 1).to(self.device)) 
+            if no_obj:
+                gj = gj.clone()
+                gi = gi.clone()
+                b = b.clone()
+                c = c.clone()
             indice = (b, a, gj.clamp_(0, shape[2] - 1), gi.clamp_(0, shape[3] - 1)) 
             indices.append(indice)  # image, anchor, grid
             #box = torch.cat((gxy - gij, gwh), 1).to(self.device)
