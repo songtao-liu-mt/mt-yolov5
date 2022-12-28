@@ -101,7 +101,7 @@ class Loggers():
         if self.wandb:
             self.wandb.log({"Labels": [wandb.Image(str(x), caption=x.name) for x in paths]})
 
-    def on_train_batch_end(self, ni, model, imgs, targets, paths, plots):
+    def on_train_batch_end(self, ni, model, imgs, targets, paths, plots, loss_items):
         # Callback runs on train batch end
         if plots:
             if ni == 0:
@@ -115,6 +115,7 @@ class Loggers():
             if self.wandb and ni == 10:
                 files = sorted(self.save_dir.glob('train*.jpg'))
                 self.wandb.log({'Mosaics': [wandb.Image(str(f), caption=f.name) for f in files if f.exists()]})
+
 
     def on_train_epoch_end(self, epoch):
         # Callback runs on train epoch end

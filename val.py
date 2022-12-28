@@ -278,7 +278,7 @@ def run(
         nt = torch.zeros(1)
 
     # Print results
-    pf = '%20s' + '%11i' * 2 + '%11.3g' * 4  # print format
+    pf = '%20s' + '%11i' * 2 + '%11.5g' * 4  # print format
     LOGGER.info(pf % ('all', seen, nt.sum(), mp, mr, map50, map))
 
     # Print results per class

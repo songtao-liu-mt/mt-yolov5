@@ -235,9 +235,9 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
     stopper, stop = EarlyStopping(patience=opt.patience), False
 
+    compute_loss = ComputeLoss(model)  
     model = model.to(device)
     model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc  # attach class weights
-    compute_loss = ComputeLoss(model)  
 
     # EMA
     ema = ModelEMA(model, device) if RANK in {-1, 0} else None
@@ -306,7 +306,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     optimizer = hvd.DistributedOptimizer(
         optimizer, named_parameters=model.named_parameters(),
         compression=hvd.Compression.none,
-        backward_passes_per_step=accumulate,
+        backward_passes_per_step=1,
         op=hvd.Average)
     
     # Horovod: broadcast parameters & optimizer state.
@@ -319,8 +319,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 f"Logging results to {colorstr('bold', save_dir)}\n"
                 f'Starting training for {epochs} epochs...')
 
-    mloss = torch.zeros(3, device=device)  # mean losses
-    #mloss = torch.zeros(3)  # mean losses
+    #mloss = torch.zeros(3, device=device)  # mean losses
+    mloss = torch.zeros(3)  # mean losses
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         callbacks.run('on_train_epoch_start')
         model.train()
@@ -343,7 +343,6 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             pbar = tqdm(pbar, total=nb, bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}')  # progress bar
         optimizer.zero_grad()
         for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
-            has_nan = False
             callbacks.run('on_train_batch_start')
             ni = i + nb * epoch  # number integrated batches (since train start)
             imgs = imgs.float().to(device, non_blocking=True) / 255  # uint8 to float32, 0-255 to 0.0-1.0
@@ -368,13 +367,26 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     imgs = nn.functional.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
 
             # Forward
-            if ni - last_opt_step >= accumulate:
-                optimizer.zero_grad()
             #with torch.cuda.amp.autocast(amp):
+            for n, p in model.named_parameters():
+                if torch.any(torch.isnan(p)):
+                    LOGGER.info("+++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
+                    LOGGER.info("nan is detected in model: ", n)
+                    LOGGER.info("shape: ", p.shape)
+                    sys.exit()
             pred = model(imgs)  # forward
-            # pred = [x.cpu() for x in pred]
-            loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
-            # loss, loss_items = compute_loss(pred, targets)  # loss scaled by batch_size
+            pred = [x.cpu() for x in pred]
+            for x in pred:
+                if torch.any(torch.isnan(x)):
+                    LOGGER.info("+++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
+                    LOGGER.info("nan is detected in forward pred tensor: ", x.shape)
+                    sys.exit()
+            #loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
+            loss, loss_items = compute_loss(pred, targets)  # loss scaled by batch_size
+            if torch.any(torch.isnan(loss)):
+                    LOGGER.info("+++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
+                    LOGGER.info("nan is detected in loss tensor: ", loss)
+                    sys.exit()
             if RANK != -1:
                 loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
             if opt.quad:
@@ -384,25 +396,23 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             #scaler.scale(loss).backward()
             loss.backward()
             for n, p in model.named_parameters():
+                if torch.any(torch.isnan(p)):
+                    LOGGER.info("+++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
+                    LOGGER.info("after backward, nan is detected in model weight: ", n)
+                    LOGGER.info("shape: ", p.shape)
+                    sys.exit()
                 if torch.any(torch.isnan(p.grad)):
-                    LOGGER.warning("+++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
-                    LOGGER.warning("after backward, nan is detected in model {}'s grad on rank {}: ".format(n, RANK))
-                    LOGGER.warning("shape: ", p.grad.shape)
-                    has_nan = True
+                    LOGGER.info("+++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
+                    LOGGER.info("after backward, nan is detected in model grad: ", n)
+                    LOGGER.info("shape: ", p.grad.shape)
+                    sys.exit()
 
-            # if (ni + RANK) % 200 == 0 and RANK == 1:
-                # LOGGER.warning("skip iter {} on rank {}".format(ni, RANK))
-                # has_nan = True
 
-            optimizer.synchronize()
-            if has_nan:
-                optimizer.zero_grad()
 
             # Optimize
             if ni - last_opt_step >= accumulate:
-                with optimizer.skip_synchronize():
-                    if not has_nan:
-                        optimizer.step()
+                optimizer.step()
+                optimizer.zero_grad()
                 if ema:
                     ema.update(model)
                 last_opt_step = ni

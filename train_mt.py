@@ -306,7 +306,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     optimizer = hvd.DistributedOptimizer(
         optimizer, named_parameters=model.named_parameters(),
         compression=hvd.Compression.none,
-        backward_passes_per_step=accumulate,
+        backward_passes_per_step=1,
         op=hvd.Average)
     
     # Horovod: broadcast parameters & optimizer state.
@@ -320,7 +320,6 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 f'Starting training for {epochs} epochs...')
 
     mloss = torch.zeros(3, device=device)  # mean losses
-    #mloss = torch.zeros(3)  # mean losses
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         callbacks.run('on_train_epoch_start')
         model.train()
@@ -339,11 +338,10 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             train_loader.sampler.set_epoch(epoch)
         pbar = enumerate(train_loader)
         if RANK in {-1, 0}:
-            LOGGER.info(('\n' + '%10s' * 7) % ('Epoch', 'iteration', 'box', 'obj', 'cls', 'labels', 'img_size'))
-            pbar = tqdm(pbar, total=nb, bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}')  # progress bar
+            LOGGER.info(('\n' + '%10s' * 7) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'labels', 'img_size'))
+            pbar = tqdm(pbar, total=nb, bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}', ncols=130)  # progress bar
         optimizer.zero_grad()
         for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
-            has_nan = False
             callbacks.run('on_train_batch_start')
             ni = i + nb * epoch  # number integrated batches (since train start)
             imgs = imgs.float().to(device, non_blocking=True) / 255  # uint8 to float32, 0-255 to 0.0-1.0
@@ -368,13 +366,9 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     imgs = nn.functional.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
 
             # Forward
-            if ni - last_opt_step >= accumulate:
-                optimizer.zero_grad()
             #with torch.cuda.amp.autocast(amp):
             pred = model(imgs)  # forward
-            # pred = [x.cpu() for x in pred]
             loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
-            # loss, loss_items = compute_loss(pred, targets)  # loss scaled by batch_size
             if RANK != -1:
                 loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
             if opt.quad:
@@ -383,26 +377,13 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             # Backward
             #scaler.scale(loss).backward()
             loss.backward()
-            for n, p in model.named_parameters():
-                if torch.any(torch.isnan(p.grad)):
-                    LOGGER.warning("+++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
-                    LOGGER.warning("after backward, nan is detected in model {}'s grad on rank {}: ".format(n, RANK))
-                    LOGGER.warning("shape: ", p.grad.shape)
-                    has_nan = True
 
-            # if (ni + RANK) % 200 == 0 and RANK == 1:
-                # LOGGER.warning("skip iter {} on rank {}".format(ni, RANK))
-                # has_nan = True
 
-            optimizer.synchronize()
-            if has_nan:
-                optimizer.zero_grad()
 
             # Optimize
             if ni - last_opt_step >= accumulate:
-                with optimizer.skip_synchronize():
-                    if not has_nan:
-                        optimizer.step()
+                optimizer.step()
+                optimizer.zero_grad()
                 if ema:
                     ema.update(model)
                 last_opt_step = ni
@@ -410,12 +391,10 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             # Log
             if RANK in {-1, 0}:
                 mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
-                # mem = f'{torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0:.3g}G'  # (GB)
-                LOGGER.info(('%10s' * 2 + '%10.5g' * 5) %
-                            (f'{epoch}/{epochs - 1}', ni, *mloss, targets.shape[0], imgs.shape[-1]))
-                # pbar.set_description(('%10s' * 2 + '%10.5g' * 5) %
-                                    # (f'{epoch}/{epochs - 1}', ni, *mloss, targets.shape[0], imgs.shape[-1]))
-                callbacks.run('on_train_batch_end', ni, model, imgs, targets, paths, plots, loss_items)
+                mem = f'{torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0:.3g}G'  # (GB)
+                pbar.set_description(('%10s' * 2 + '%10.4g' * 5) %
+                                    (f'{epoch}/{epochs - 1}', mem, *mloss, targets.shape[0], imgs.shape[-1]))
+                callbacks.run('on_train_batch_end', ni, model, imgs, targets, paths, plots)
                 if callbacks.stop_training:
                     return
             # end batch ------------------------------------------------------------------------------------------------

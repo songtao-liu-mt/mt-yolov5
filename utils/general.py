@@ -79,6 +79,31 @@ def is_writeable(dir, test=False):
     except OSError:
         return False
 
+def increment_path(path, exist_ok=False, sep='', mkdir=False, rank=-1):
+    # Increment file or directory path, i.e. runs/exp --> runs/exp{sep}2, runs/exp{sep}3, ... etc.
+    path = Path(path)  # os-agnostic
+    if path.exists() and not exist_ok and (rank == 0):
+        path, suffix = (path.with_suffix(''), path.suffix) if path.is_file() else (path, '')
+
+        # Method 1
+        for n in range(2, 9999):
+            p = f'{path}{sep}{n}{suffix}'  # increment path
+            if not os.path.exists(p):  #
+                break
+        path = Path(p)
+
+        # Method 2 (deprecated)
+        # dirs = glob.glob(f"{path}{sep}*")  # similar paths
+        # matches = [re.search(rf"{path.stem}{sep}(\d+)", d) for d in dirs]
+        # i = [int(m.groups()[0]) for m in matches if m]  # indices
+        # n = max(i) + 1 if i else 2  # increment number
+        # path = Path(f"{path}{sep}{n}{suffix}")  # increment path
+
+    if mkdir:
+        path.mkdir(parents=True, exist_ok=True)  # make directory
+
+    return path
+
 
 def set_logging(name=None, verbose=VERBOSE):
     # Sets level and returns logger
@@ -88,11 +113,15 @@ def set_logging(name=None, verbose=VERBOSE):
     #rank = int(os.getenv('RANK', -1))  # rank in world for Multi-GPU trainings
     hvd.init()
     rank = hvd.rank() if hvd.size() > 1 else -1
-    level = logging.INFO if verbose and rank in {-1, 0} else logging.ERROR
+    filename = str(increment_path('logs/train.log', rank=rank))
+    logging.basicConfig(filename = filename, filemode='w', 
+                        format = "%(asctime)s : %(message)s",
+                        datefmt = "%Y-%m-%d %H:%M:%S")
+    level = logging.INFO if verbose and rank in {-1, 0} else logging.WARNING
     log = logging.getLogger(name)
     log.setLevel(level)
     handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("%(message)s"))
+    handler.setFormatter(logging.Formatter("%(asctime)s : %(message)s"))
     handler.setLevel(level)
     log.addHandler(handler)
 
@@ -977,30 +1006,6 @@ def apply_classifier(x, model, img, im0):
     return x
 
 
-def increment_path(path, exist_ok=False, sep='', mkdir=False):
-    # Increment file or directory path, i.e. runs/exp --> runs/exp{sep}2, runs/exp{sep}3, ... etc.
-    path = Path(path)  # os-agnostic
-    if path.exists() and not exist_ok:
-        path, suffix = (path.with_suffix(''), path.suffix) if path.is_file() else (path, '')
-
-        # Method 1
-        for n in range(2, 9999):
-            p = f'{path}{sep}{n}{suffix}'  # increment path
-            if not os.path.exists(p):  #
-                break
-        path = Path(p)
-
-        # Method 2 (deprecated)
-        # dirs = glob.glob(f"{path}{sep}*")  # similar paths
-        # matches = [re.search(rf"{path.stem}{sep}(\d+)", d) for d in dirs]
-        # i = [int(m.groups()[0]) for m in matches if m]  # indices
-        # n = max(i) + 1 if i else 2  # increment number
-        # path = Path(f"{path}{sep}{n}{suffix}")  # increment path
-
-    if mkdir:
-        path.mkdir(parents=True, exist_ok=True)  # make directory
-
-    return path
 
 
 # OpenCV Chinese-friendly functions ------------------------------------------------------------------------------------
