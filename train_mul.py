@@ -180,7 +180,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     if RANK in {-1, 0}:
         val_loader = create_dataloader(val_path,
                                        imgsz,
-                                       batch_size // WORLD_SIZE * 2,
+                                       batch_size // WORLD_SIZE,
                                        gs,
                                        single_cls,
                                        hyp=hyp,
@@ -371,7 +371,9 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             if ni - last_opt_step >= accumulate:
                 optimizer.zero_grad()
             #with torch.cuda.amp.autocast(amp):
+
             pred = model(imgs)  # forward
+
             # pred = [x.cpu() for x in pred]
             loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
             # loss, loss_items = compute_loss(pred, targets)  # loss scaled by batch_size
@@ -383,18 +385,22 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             # Backward
             #scaler.scale(loss).backward()
             loss.backward()
-            for n, p in model.named_parameters():
-                if torch.any(torch.isnan(p.grad)):
-                    LOGGER.warning("+++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
-                    LOGGER.warning("after backward, nan is detected in model {}'s grad on rank {}: ".format(n, RANK))
-                    LOGGER.warning("shape: ", p.grad.shape)
-                    has_nan = True
+
 
             # if (ni + RANK) % 200 == 0 and RANK == 1:
                 # LOGGER.warning("skip iter {} on rank {}".format(ni, RANK))
                 # has_nan = True
 
             optimizer.synchronize()
+
+            for n, p in model.named_parameters():
+                if torch.any(torch.isnan(p.grad)):
+                    has_nan = True
+                    break
+                if torch.any(p.grad > 100):
+                    has_nan = True
+                    break
+
             if has_nan:
                 optimizer.zero_grad()
 
@@ -403,6 +409,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 with optimizer.skip_synchronize():
                     if not has_nan:
                         optimizer.step()
+
                 if ema:
                     ema.update(model)
                 last_opt_step = ni
@@ -411,10 +418,10 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             if RANK in {-1, 0}:
                 mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
                 # mem = f'{torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0:.3g}G'  # (GB)
-                LOGGER.info(('%10s' * 2 + '%10.5g' * 5) %
-                            (f'{epoch}/{epochs - 1}', ni, *mloss, targets.shape[0], imgs.shape[-1]))
-                # pbar.set_description(('%10s' * 2 + '%10.5g' * 5) %
-                                    # (f'{epoch}/{epochs - 1}', ni, *mloss, targets.shape[0], imgs.shape[-1]))
+                # LOGGER.info(('%10s' * 2 + '%10.5g' * 5) %
+                            # (f'{epoch}/{epochs - 1}', ni, *mloss, targets.shape[0], imgs.shape[-1]))
+                pbar.set_description(('%10s' * 2 + '%10.5g' * 5) %
+                                    (f'{epoch}/{epochs - 1}', ni, *mloss, targets.shape[0], imgs.shape[-1]))
                 callbacks.run('on_train_batch_end', ni, model, imgs, targets, paths, plots, loss_items)
                 if callbacks.stop_training:
                     return
@@ -494,7 +501,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     LOGGER.info(f'\nValidating {f}...')
                     results, _, _ = val.run(
                         data_dict,
-                        batch_size=batch_size // WORLD_SIZE * 2,
+                        batch_size=batch_size // WORLD_SIZE,
                         imgsz=imgsz,
                         model=attempt_load(f, device).float(),
                         iou_thres=0.65 if is_coco else 0.60,  # best pycocotools results at 0.65
@@ -596,7 +603,10 @@ def main(opt, callbacks=Callbacks()):
             opt.exist_ok, opt.resume = opt.resume, False  # pass resume to exist_ok and disable resume
         if opt.name == 'cfg':
             opt.name = Path(opt.cfg).stem  # use model.yaml as name
-        opt.save_dir = str(increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok))
+        if RANK in {-1, 0}:
+            opt.save_dir = str(increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok))
+        else:
+            opt.save_dir = ""
 
     # DDP mode
     if LOCAL_RANK != -1:

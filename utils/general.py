@@ -79,10 +79,10 @@ def is_writeable(dir, test=False):
     except OSError:
         return False
 
-def increment_path(path, exist_ok=False, sep='', mkdir=False, rank=-1):
+def increment_path(path, exist_ok=False, sep='', mkdir=False):
     # Increment file or directory path, i.e. runs/exp --> runs/exp{sep}2, runs/exp{sep}3, ... etc.
     path = Path(path)  # os-agnostic
-    if path.exists() and not exist_ok and (rank == 0):
+    if path.exists() and not exist_ok:
         path, suffix = (path.with_suffix(''), path.suffix) if path.is_file() else (path, '')
 
         # Method 1
@@ -113,11 +113,11 @@ def set_logging(name=None, verbose=VERBOSE):
     #rank = int(os.getenv('RANK', -1))  # rank in world for Multi-GPU trainings
     hvd.init()
     rank = hvd.rank() if hvd.size() > 1 else -1
-    filename = str(increment_path('logs/train.log', rank=rank))
+    filename = 'logs/train.log'
     logging.basicConfig(filename = filename, filemode='w', 
                         format = "%(asctime)s : %(message)s",
                         datefmt = "%Y-%m-%d %H:%M:%S")
-    level = logging.INFO if verbose and rank in {-1, 0} else logging.WARNING
+    level = logging.INFO if verbose and rank in {-1, 0} else logging.ERROR
     log = logging.getLogger(name)
     log.setLevel(level)
     handler = logging.StreamHandler()
