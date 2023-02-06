@@ -20,6 +20,7 @@ import torch.nn as nn
 import yaml
 from PIL import Image
 from torch.cuda import amp
+import torch.utils.checkpoint as ckpt
 
 from utils.dataloaders import exif_transpose, letterbox
 from utils.general import (LOGGER, check_requirements, check_suffix, check_version, colorstr, increment_path,
@@ -35,16 +36,40 @@ def autopad(k, p=None):  # kernel, padding
     return p
 
 
+class ModuleWrapperIgnores2ndArg(nn.Module):
+    def __init__(self, module):
+        super().__init__()
+        self.module = module
+    
+    def forward(self, x, dummy_tensor=None):
+        assert dummy_tensor != None
+        x = self.module(x)
+        return x
+
+
 class Conv(nn.Module):
     # Standard convolution
-    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True):  # ch_in, ch_out, kernel, stride, padding, groups
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True, ckpt=False):  # ch_in, ch_out, kernel, stride, padding, groups
         super().__init__()
         self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=False)
         self.bn = nn.BatchNorm2d(c2)
         self.act = nn.SiLU() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
+        self.ckpt = ckpt
+        # self.dummy_tensor = torch.ones(1, dtype=torch.float32, requires_grad=True)
+        # self.module_wrapper = ModuleWrapperIgnores2ndArg(nn.Sequential(*[self.conv, self.bn, self.act]))
+
+    def _forward(self, x):
+        # if dummy_tensor:
+        #     assert dummy_tensor.requires_grad
+        return self.act(self.bn(self.conv(x)))
 
     def forward(self, x):
-        return self.act(self.bn(self.conv(x)))
+        if self.ckpt:
+            # x = ckpt.checkpoint(self.module_wrapper, x, self.dummy_tensor)
+            x = ckpt.checkpoint(self._forward, x, use_reentrant=False)
+        else:
+            x = self._forward(x)
+        return x
         #print("000000000000")
         #if (x.type() == 'torch.musa.FloatTensor'):
             #import ipdb; ipdb.set_trace()
@@ -156,12 +181,12 @@ class CrossConv(nn.Module):
 
 class C3(nn.Module):
     # CSP Bottleneck with 3 convolutions
-    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5, ckpt=False):  # ch_in, ch_out, number, shortcut, groups, expansion
         super().__init__()
         c_ = int(c2 * e)  # hidden channels
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c1, c_, 1, 1)
-        self.cv3 = Conv(2 * c_, c2, 1)  # optional act=FReLU(c2)
+        self.cv1 = Conv(c1, c_, 1, 1, ckpt=ckpt)
+        self.cv2 = Conv(c1, c_, 1, 1, ckpt=ckpt)
+        self.cv3 = Conv(2 * c_, c2, 1, ckpt=ckpt)  # optional act=FReLU(c2)
         self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
 
     def forward(self, x):

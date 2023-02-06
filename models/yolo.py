@@ -28,10 +28,23 @@ from utils.plots import feature_visualization
 from utils.torch_utils import (fuse_conv_and_bn, initialize_weights, model_info, profile, scale_img, select_device,
                                time_sync)
 
+import torch.utils.checkpoint as ckpt
+
 try:
     import thop  # for FLOPs computation
 except ImportError:
     thop = None
+
+
+class ModuleWrapperIgnores2ndArg(nn.Module):
+    def __init__(self, module):
+        super().__init__()
+        self.module = module
+    
+    def forward(self, x, dummy_tensor=None):
+        assert dummy_tensor != None
+        x = self.module(x)
+        return x
 
 
 class Detect(nn.Module):
@@ -39,7 +52,7 @@ class Detect(nn.Module):
     onnx_dynamic = False  # ONNX export parameter
     export = False  # export mode
 
-    def __init__(self, nc=80, anchors=(), ch=(), inplace=True):  # detection layer
+    def __init__(self, nc=80, anchors=(), ch=(), inplace=True, ckpt=False):  # detection layer
         super().__init__()
         self.nc = nc  # number of classes
         self.no = nc + 5  # number of outputs per anchor
@@ -50,8 +63,9 @@ class Detect(nn.Module):
         self.register_buffer('anchors', torch.tensor(anchors).float().view(self.nl, -1, 2))  # shape(nl,na,2)
         self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch)  # output conv
         self.inplace = inplace  # use in-place ops (e.g. slice assignment)
+        self.ckpt = ckpt
 
-    def forward(self, x):
+    def _forward(self, x):
         z = []  # inference output
         for i in range(self.nl):
             x[i] = self.m[i](x[i])  # conv
@@ -74,6 +88,13 @@ class Detect(nn.Module):
                 z.append(y.view(bs, -1, self.no))
 
         return x if self.training else (torch.cat(z, 1),) if self.export else (torch.cat(z, 1), x)
+
+    def forward(self, x):
+        if self.ckpt:
+            x = ckpt.checkpoint(self._forward, x)
+        else:
+            x = self._forward(x)
+        return x
 
     def _make_grid(self, nx=20, ny=20, i=0):
         d = self.anchors[i].device
@@ -103,15 +124,21 @@ class Model(nn.Module):
 
         # Define model
         ch = self.yaml['ch'] = self.yaml.get('ch', ch)  # input channels
+        self.yaml['ckpt'] = self.yaml.get('ckpt', None)
+        self.use_ckpt = self.yaml['ckpt'] != None
         if nc and nc != self.yaml['nc']:
             LOGGER.info(f"Overriding model.yaml nc={self.yaml['nc']} with nc={nc}")
             self.yaml['nc'] = nc  # override yaml value
         if anchors:
             LOGGER.info(f'Overriding model.yaml anchors with anchors={anchors}')
             self.yaml['anchors'] = round(anchors)  # override yaml value
+        # if self.use_ckpt:
+        #     self.ckpt_layers, self.remain_layers, self.save = parse_model(deepcopy(self.yaml), ch=[ch])
+        # else:
         self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch])  # model, savelist
         self.names = [str(i) for i in range(self.yaml['nc'])]  # default names
         self.inplace = self.yaml.get('inplace', True)
+        # self.ckpt_module = ModuleWrapperIgnores2ndArg(self.ckpt_layers)
 
         # Build strides, anchors
         m = self.model[-1]  # Detect()
@@ -148,7 +175,7 @@ class Model(nn.Module):
         y = self._clip_augmented(y)  # clip augmented tails
         return torch.cat(y, 1), None  # augmented inference, train
 
-    def _forward_once(self, x, profile=False, visualize=False):
+    def _forward_once_ckpt(self, x, profile=False, visualize=False):
         y, dt = [], []  # outputs
         for m in self.model:
             if m.f != -1:  # if not from previous layer
@@ -159,6 +186,13 @@ class Model(nn.Module):
             y.append(x if m.i in self.save else None)  # save output
             if visualize:
                 feature_visualization(x, m.type, m.i, save_dir=visualize)
+        return x
+
+    def _forward_once(self, x, profile=False, visualize=False):
+        if self.use_ckpt:
+            x = ckpt.checkpoint(self._forward_once_ckpt, x, profile, visualize, use_reentrant=False)
+        else:
+            x = self._forward_once_ckpt(x, profile, visualize)
         return x
 
     def _descale_pred(self, p, flips, scale, img_size):
@@ -246,6 +280,7 @@ class Model(nn.Module):
             m.grid = list(map(fn, m.grid))
             if isinstance(m.anchor_grid, list):
                 m.anchor_grid = list(map(fn, m.anchor_grid))
+        # self.dummy_tensor = fn(self.dummy_tensor)
         return self
 
 
@@ -254,8 +289,10 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
     anchors, nc, gd, gw = d['anchors'], d['nc'], d['depth_multiple'], d['width_multiple']
     na = (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors  # number of anchors
     no = na * (nc + 5)  # number of outputs = anchors * (classes + 5)
+    ckpt_list = d['ckpt']
 
     layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
+    # ckpt_layers = []
     for i, (f, n, m, args) in enumerate(d['backbone'] + d['head']):  # from, number, module, args
         m = eval(m) if isinstance(m, str) else m  # eval strings
         for j, a in enumerate(args):
@@ -264,6 +301,7 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
             except NameError:
                 pass
 
+        kwargs = {}
         n = n_ = max(round(n * gd), 1) if n > 1 else n  # depth gain
         if m in (Conv, GhostConv, Bottleneck, GhostBottleneck, SPP, SPPF, DWConv, MixConv2d, Focus, CrossConv,
                  BottleneckCSP, C3, C3TR, C3SPP, C3Ghost, nn.ConvTranspose2d, DWConvTranspose2d, C3x):
@@ -275,6 +313,8 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
             if m in [BottleneckCSP, C3, C3TR, C3Ghost, C3x]:
                 args.insert(2, n)  # number of repeats
                 n = 1
+            # if (m == Conv or m == C3) and ckpt_list and "conv" in ckpt_list:
+            #     kwargs["ckpt"] = True
         elif m is nn.BatchNorm2d:
             args = [ch[f]]
         elif m is Concat:
@@ -283,6 +323,8 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
             args.append([ch[x] for x in f])
             if isinstance(args[1], int):  # number of anchors
                 args[1] = [list(range(args[1] * 2))] * len(f)
+            # if ckpt_list and "head" in ckpt_list:
+            #     kwargs["ckpt"] = True
         elif m is Contract:
             c2 = ch[f] * args[0] ** 2
         elif m is Expand:
@@ -290,7 +332,7 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
         else:
             c2 = ch[f]
 
-        m_ = nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
+        m_ = nn.Sequential(*(m(*args, **kwargs) for _ in range(n))) if n > 1 else m(*args, **kwargs)  # module
         t = str(m)[8:-2].replace('__main__.', '')  # module type
         np = sum(x.numel() for x in m_.parameters())  # number params
         m_.i, m_.f, m_.type, m_.np = i, f, t, np  # attach index, 'from' index, type, number params

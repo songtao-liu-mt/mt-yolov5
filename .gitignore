@@ -256,3 +256,5 @@ crashlytics-build.properties
 fabric.properties
 
 .shaders/
+.shaders_old/
+*.swp
